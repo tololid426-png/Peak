@@ -87,6 +87,7 @@ export const VideoPlayerPreview: React.FC<VideoPlayerPreviewProps> = ({
 }) => {
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [hasVideoError, setHasVideoError] = useState<boolean>(false);
+  const [fallbackAttempted, setFallbackAttempted] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
   const outputVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -102,11 +103,25 @@ export const VideoPlayerPreview: React.FC<VideoPlayerPreviewProps> = ({
 
   useEffect(() => {
     setHasVideoError(false);
+    setFallbackAttempted(false);
     if (outputVideoRef.current && generatedVideoUrl && generationStatus !== 'generating') {
       outputVideoRef.current.load();
       if (isPlaying) outputVideoRef.current.play().catch(() => {});
     }
-  }, [generatedVideoUrl, generationStatus]);
+  }, [generatedVideoUrl, generationStatus, activeJobId]);
+
+  const handleVideoError = () => {
+    // If local video URL failed and remoteVideoUrl is available, try proxy fallback
+    if (!fallbackAttempted && activeJob?.remoteVideoUrl && outputVideoRef.current) {
+      setFallbackAttempted(true);
+      const fallbackUrl = `/api/runninghub/proxy-video?url=${encodeURIComponent(activeJob.remoteVideoUrl)}`;
+      outputVideoRef.current.src = fallbackUrl;
+      outputVideoRef.current.load();
+      outputVideoRef.current.play().catch(() => {});
+      return;
+    }
+    setHasVideoError(true);
+  };
 
   const togglePlay = () => {
     const nextState = !isPlaying;
@@ -184,12 +199,12 @@ export const VideoPlayerPreview: React.FC<VideoPlayerPreviewProps> = ({
             </span>
 
             <div className="flex items-center gap-1.5">
-              {jobsList.some((j) => j.status === 'SUCCESS' || j.status === 'FAILED' || j.status === 'CANCELLED') && onClearCompleted && (
+              {jobsList.some((j) => j.status === 'FAILED' || j.status === 'CANCELLED') && onClearCompleted && (
                 <button
                   onClick={onClearCompleted}
                   className="text-[11px] font-medium text-stone-500 hover:text-red-600 px-2 py-0.5 rounded-lg hover:bg-red-50 transition-colors"
                 >
-                  Bersihkan Selesai
+                  Bersihkan Gagal
                 </button>
               )}
             </div>
@@ -211,33 +226,56 @@ export const VideoPlayerPreview: React.FC<VideoPlayerPreviewProps> = ({
                   : 'Gagal';
 
               return (
-                <button
+                <div
                   key={job.id}
-                  onClick={() => onSelectJob && onSelectJob(job.id)}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-medium shrink-0 flex items-center gap-1.5 transition-all cursor-pointer ${
+                  className={`rounded-xl shrink-0 flex items-center transition-all ${
                     isActive
                       ? 'bg-stone-900 text-white shadow-xs font-semibold'
                       : 'bg-[#f4f3ec] text-stone-700 hover:bg-stone-200/80 border border-stone-200'
                   }`}
                 >
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full ${
-                      job.status === 'RUNNING'
-                        ? 'bg-amber-400 animate-pulse'
-                        : job.status === 'WAITING'
-                        ? 'bg-blue-400'
-                        : job.status === 'SUCCESS'
-                        ? 'bg-emerald-400'
-                        : job.status === 'CANCELLED'
-                        ? 'bg-stone-400'
-                        : 'bg-red-400'
-                    }`}
-                  />
-                  <span>Job #{idx + 1}</span>
-                  <span className={`text-[10px] ${isActive ? 'text-stone-300' : 'text-stone-500'}`}>
-                    · {statusLabel}
-                  </span>
-                </button>
+                  <button
+                    onClick={() => onSelectJob && onSelectJob(job.id)}
+                    className="px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        job.status === 'RUNNING'
+                          ? 'bg-amber-400 animate-pulse'
+                          : job.status === 'WAITING'
+                          ? 'bg-blue-400'
+                          : job.status === 'SUCCESS'
+                          ? 'bg-emerald-400'
+                          : job.status === 'CANCELLED'
+                          ? 'bg-stone-400'
+                          : 'bg-red-400'
+                      }`}
+                    />
+                    <span>Job #{idx + 1}</span>
+                    <span className={`text-[10px] ${isActive ? 'text-stone-300' : 'text-stone-500'}`}>
+                      · {statusLabel}
+                    </span>
+                  </button>
+
+                  {/* Optional delete button for finished jobs */}
+                  {(job.status === 'SUCCESS' || job.status === 'FAILED' || job.status === 'CANCELLED') && onDeleteJob && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeleteJob(job.id);
+                      }}
+                      className={`pr-2 pl-0.5 py-1.5 transition-colors ${
+                        isActive
+                          ? 'text-stone-400 hover:text-red-300'
+                          : 'text-stone-400 hover:text-red-600'
+                      }`}
+                      title="Hapus job ini"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
               );
             })}
           </div>
@@ -495,7 +533,7 @@ export const VideoPlayerPreview: React.FC<VideoPlayerPreviewProps> = ({
                         loop
                         playsInline
                         controls
-                        onError={() => setHasVideoError(true)}
+                        onError={handleVideoError}
                         className="w-full h-full object-contain"
                       />
                       {elapsedSeconds > 0 && (

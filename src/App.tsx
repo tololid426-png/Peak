@@ -283,7 +283,7 @@ export default function App() {
     return upData.data.fileName;
   };
 
-  // Helper to choose key with highest available credit & no active lock
+  // Helper to choose key with no active lock instantly
   const pickBestApiKey = async (defaultKey: string): Promise<string> => {
     const candidatePool = Array.from(new Set([defaultKey, ...apiKeysPool].map((k) => k.trim()).filter(Boolean)));
     if (candidatePool.length <= 1) return defaultKey.trim();
@@ -293,43 +293,14 @@ export default function App() {
       jobsList.filter((j) => j.status === 'RUNNING' || j.status === 'WAITING').map((j) => (j.apiKey || '').trim())
     );
 
-    // Prefer keys NOT currently running a job to avoid RunningHub concurrency conflicts
-    const availableKeys = candidatePool.filter((k) => !activeKeysInUse.has(k));
-    const keysToTest = availableKeys.length > 0 ? availableKeys : candidatePool;
+    // If default key is free, use it immediately
+    if (!activeKeysInUse.has(defaultKey.trim())) {
+      return defaultKey.trim();
+    }
 
-    // Fetch live credit balance for candidate keys in parallel with 3s timeout
-    const evaluated = await Promise.all(
-      keysToTest.map(async (k) => {
-        try {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 3000);
-
-          const res = await fetch('/api/runninghub/check-key', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ apiKey: k }),
-            signal: controller.signal,
-          });
-          clearTimeout(timer);
-
-          const data = await res.json();
-          let score = 0;
-          if (data.code === 0 && data.balance) {
-            const parsed = parseFloat(data.balance);
-            if (!isNaN(parsed)) score = parsed;
-            else if (data.balance.includes('Aktif') || data.balance.includes('Valid')) score = 100;
-          }
-          return { key: k, score };
-        } catch {
-          return { key: k, score: 0 };
-        }
-      })
-    );
-
-    // Sort by highest credit score
-    evaluated.sort((a, b) => b.score - a.score);
-
-    return evaluated[0]?.key || defaultKey;
+    // Pick first available key that is not locked by another active job
+    const freeKey = candidatePool.find((k) => !activeKeysInUse.has(k));
+    return freeKey || defaultKey.trim();
   };
 
   // Handle Generate New Job

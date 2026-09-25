@@ -315,6 +315,35 @@ export function initStorage() {
   processQueue();
 }
 
+/**
+ * Background auto-healer for local video files if temporarily lost
+ */
+async function healLocalVideo(job: JobRecord) {
+  if (!job.remoteVideoUrl || !job.videoFileName) return;
+  const videoLocalPath = path.join(VIDEOS_DIR, job.videoFileName);
+  if (fs.existsSync(videoLocalPath) && fs.statSync(videoLocalPath).size > 10240) return;
+
+  try {
+    const res = await fetch(job.remoteVideoUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    });
+    if (res.ok) {
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer.length > 10240) {
+        fs.writeFileSync(videoLocalPath, buffer);
+        job.videoUrl = `/storage/videos/${job.videoFileName}`;
+        saveJobsToDisk();
+        console.log(`[Storage Auto-Heal] Video berhasil dipulihkan secara lokal: ${job.videoFileName}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[Storage Auto-Heal] Gagal memulihkan video untuk job ${job.id}:`, err);
+  }
+}
+
 function loadJobsFromDisk() {
   try {
     if (fs.existsSync(JOBS_DB_PATH)) {
@@ -327,6 +356,18 @@ function loadJobsFromDisk() {
           job.status = 'WAITING';
           job.step = 'Melanjutkan antrian setelah restart server...';
         }
+
+        // Validate local video path
+        if (job.status === 'SUCCESS' && job.videoFileName) {
+          const vPath = path.join(VIDEOS_DIR, job.videoFileName);
+          if (fs.existsSync(vPath) && fs.statSync(vPath).size > 10240) {
+            job.videoUrl = `/storage/videos/${job.videoFileName}`;
+          } else if (job.remoteVideoUrl) {
+            job.videoUrl = `/api/runninghub/proxy-video?url=${encodeURIComponent(job.remoteVideoUrl)}`;
+            healLocalVideo(job);
+          }
+        }
+
         jobsMap.set(job.id, job);
       }
       console.log(`[Storage] Loaded ${jobsMap.size} jobs from disk.`);
@@ -474,10 +515,16 @@ export function createJob(params: {
 }
 
 export function getJob(jobId: string): JobRecord | null {
+  if (!jobsMap.has(jobId) && fs.existsSync(JOBS_DB_PATH)) {
+    loadJobsFromDisk();
+  }
   return getJobWithQueueInfo(jobId);
 }
 
 export function findJobByFileName(fileName: string): JobRecord | null {
+  if (jobsMap.size === 0 && fs.existsSync(JOBS_DB_PATH)) {
+    loadJobsFromDisk();
+  }
   for (const job of jobsMap.values()) {
     if (job.videoFileName === fileName || fileName.includes(job.id)) {
       return getJobWithQueueInfo(job.id);
@@ -541,12 +588,12 @@ export function deleteJob(jobId: string): boolean {
 }
 
 /**
- * Clear all completed, failed, or cancelled jobs (keeps running and waiting)
+ * Clear all failed or cancelled jobs (preserves successful completed video jobs)
  */
 export function clearFinishedJobs(): number {
   let count = 0;
   for (const [id, job] of Array.from(jobsMap.entries())) {
-    if (job.status === 'SUCCESS' || job.status === 'FAILED' || job.status === 'CANCELLED') {
+    if (job.status === 'FAILED' || job.status === 'CANCELLED') {
       deleteJob(id);
       count++;
     }
@@ -558,6 +605,10 @@ export function clearFinishedJobs(): number {
  * Get all recent jobs list (sorted newest first, up to limit)
  */
 export function getRecentJobs(limit: number = 20): JobRecord[] {
+  if (jobsMap.size === 0 && fs.existsSync(JOBS_DB_PATH)) {
+    loadJobsFromDisk();
+  }
+
   const allJobs = Array.from(jobsMap.values())
     .sort((a, b) => b.createdAt - a.createdAt)
     .slice(0, limit);
@@ -609,6 +660,7 @@ function getJobWithQueueInfo(jobId: string): JobRecord | null {
       if (!fs.existsSync(videoPath) || fs.statSync(videoPath).size < 10240) {
         if (job.remoteVideoUrl) {
           job.videoUrl = `/api/runninghub/proxy-video?url=${encodeURIComponent(job.remoteVideoUrl)}`;
+          healLocalVideo(job);
         }
       } else {
         job.videoUrl = `/storage/videos/${job.videoFileName}`;

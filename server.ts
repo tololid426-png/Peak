@@ -54,14 +54,8 @@ async function createServer() {
     }
   };
 
-  // Flawless byte-range video streaming endpoint (Safari / Chrome / iOS / Android support)
-  app.get('/storage/videos/:filename', (req: Request, res: Response) => {
-    const filePath = path.join(VIDEOS_DIR, req.params.filename);
-    if (!fs.existsSync(filePath)) {
-      res.status(404).send('Video not found');
-      return;
-    }
-
+  // Helper to stream local video file with accurate byte ranges
+  const streamLocalVideo = (filePath: string, req: Request, res: Response) => {
     try {
       const stat = fs.statSync(filePath);
       const fileSize = stat.size;
@@ -85,6 +79,7 @@ async function createServer() {
           'Content-Length': chunksize,
           'Content-Type': 'video/mp4',
           'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=86400',
         };
 
         res.writeHead(206, head);
@@ -95,6 +90,7 @@ async function createServer() {
           'Content-Type': 'video/mp4',
           'Accept-Ranges': 'bytes',
           'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=86400',
         };
         res.writeHead(200, head);
         fs.createReadStream(filePath).pipe(res);
@@ -105,6 +101,64 @@ async function createServer() {
         res.status(500).send('Error streaming video file');
       }
     }
+  };
+
+  // Flawless byte-range video streaming endpoint (Safari / Chrome / iOS / Android support)
+  app.get('/storage/videos/:filename', async (req: Request, res: Response) => {
+    const filename = req.params.filename;
+    const filePath = path.join(VIDEOS_DIR, filename);
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 10240) {
+      return streamLocalVideo(filePath, req, res);
+    }
+
+    // Auto-heal from known job if local file was missing
+    const matchedJob = findJobByFileName(filename);
+    if (matchedJob?.remoteVideoUrl) {
+      try {
+        const remoteRes = await fetch(matchedJob.remoteVideoUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) RunningHubClient/1.0',
+            ...(req.headers.range ? { Range: req.headers.range } : {}),
+          },
+        });
+
+        if (remoteRes.ok || remoteRes.status === 206) {
+          const contentType = remoteRes.headers.get('content-type') || 'video/mp4';
+          const contentLength = remoteRes.headers.get('content-length');
+          const contentRange = remoteRes.headers.get('content-range');
+          const acceptRanges = remoteRes.headers.get('accept-ranges') || 'bytes';
+
+          const forwardHeaders: Record<string, any> = {
+            'Content-Type': contentType,
+            'Accept-Ranges': acceptRanges,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400',
+          };
+          if (contentLength) forwardHeaders['Content-Length'] = contentLength;
+          if (contentRange) forwardHeaders['Content-Range'] = contentRange;
+
+          res.writeHead(remoteRes.status, forwardHeaders);
+
+          if (remoteRes.body) {
+            const reader = remoteRes.body.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(value);
+            }
+            res.end();
+          } else {
+            res.end();
+          }
+          return;
+        }
+      } catch (err) {
+        console.error('Auto-heal stream error:', err);
+      }
+    }
+
+    res.status(404).send('Video not found');
   });
 
   // Serve persistent stored videos & thumbnails (Accessible for 48 hours)
@@ -543,51 +597,61 @@ async function createServer() {
     }
 
     try {
-      const videoRes = await fetch(videoUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        },
+      // 1. Check if this remote URL matches a video already cached on local disk
+      const matchingJob = findJobByFileName(path.basename(videoUrl)) || Array.from(fs.readdirSync(VIDEOS_DIR)).find((f) => {
+        const full = path.join(VIDEOS_DIR, f);
+        return f.includes(path.basename(videoUrl, path.extname(videoUrl)));
       });
 
-      if (!videoRes.ok) {
-        res.status(videoRes.status).send('Failed to fetch remote video');
+      if (matchingJob) {
+        const localPath = path.join(VIDEOS_DIR, typeof matchingJob === 'string' ? matchingJob : (matchingJob as any).videoFileName || '');
+        if (fs.existsSync(localPath) && fs.statSync(localPath).size > 10240) {
+          return streamLocalVideo(localPath, req, res);
+        }
+      }
+
+      // 2. Stream directly from upstream with Range forwarding to prevent high memory usage
+      const headers: Record<string, string> = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) RunningHubClient/1.0',
+      };
+      if (req.headers.range) {
+        headers['Range'] = req.headers.range;
+      }
+
+      const upstreamRes = await fetch(videoUrl, { headers });
+
+      if (!upstreamRes.ok && upstreamRes.status !== 206) {
+        res.status(upstreamRes.status).send('Failed to fetch remote video');
         return;
       }
 
-      const arrayBuffer = await videoRes.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      const fileSize = buffer.length;
+      const status = upstreamRes.status;
+      const contentType = upstreamRes.headers.get('content-type') || 'video/mp4';
+      const contentLength = upstreamRes.headers.get('content-length');
+      const contentRange = upstreamRes.headers.get('content-range');
+      const acceptRanges = upstreamRes.headers.get('accept-ranges') || 'bytes';
 
-      const range = req.headers.range;
-      if (range) {
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const forwardHeaders: Record<string, any> = {
+        'Content-Type': contentType,
+        'Accept-Ranges': acceptRanges,
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=86400',
+      };
+      if (contentLength) forwardHeaders['Content-Length'] = contentLength;
+      if (contentRange) forwardHeaders['Content-Range'] = contentRange;
 
-        if (start >= fileSize) {
-          res.status(416).send('Requested range not satisfiable\n' + start + ' >= ' + fileSize);
-          return;
+      res.writeHead(status, forwardHeaders);
+
+      if (upstreamRes.body) {
+        const reader = upstreamRes.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
         }
-
-        const chunksize = (end - start) + 1;
-        const sliced = buffer.slice(start, end + 1);
-
-        res.writeHead(206, {
-          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-          'Accept-Ranges': 'bytes',
-          'Content-Length': chunksize,
-          'Content-Type': 'video/mp4',
-          'Access-Control-Allow-Origin': '*',
-        });
-        res.end(sliced);
+        res.end();
       } else {
-        res.writeHead(200, {
-          'Content-Length': fileSize,
-          'Content-Type': 'video/mp4',
-          'Accept-Ranges': 'bytes',
-          'Access-Control-Allow-Origin': '*',
-        });
-        res.end(buffer);
+        res.end();
       }
     } catch (err: any) {
       console.error('Error streaming proxy video:', err);
@@ -702,121 +766,68 @@ async function createServer() {
 
     const cleanKey = String(apiKey).trim();
 
-    const extractNumericBalance = (obj: any): string | null => {
-      if (obj === null || obj === undefined) return null;
-      if (typeof obj === 'number') return String(obj);
-      if (typeof obj === 'string' && obj.trim() !== '' && !isNaN(Number(obj))) return obj.trim();
-
-      if (typeof obj === 'object') {
-        const priorityFields = [
-          'userCoins',
-          'coins',
-          'user_coins',
-          'balance',
-          'remainMoney',
-          'remain_money',
-          'remainCoins',
-          'remain_coins',
-          'points',
-          'credit',
-          'credits',
-          'remains',
-          'amount',
-          'coinBalance',
-          'surplusCoins',
-        ];
-
-        for (const f of priorityFields) {
-          if (obj[f] !== undefined && obj[f] !== null) {
-            const val = obj[f];
-            if (typeof val === 'number') return String(val);
-            if (typeof val === 'string' && val.trim() !== '' && !isNaN(Number(val))) return val.trim();
-          }
-        }
-
-        // Deep search in nested objects if data is wrapped
-        if (obj.data) {
-          const nested = extractNumericBalance(obj.data);
-          if (nested !== null) return nested;
-        }
-      }
-      return null;
-    };
-
     try {
-      const endpoints = [
-        'https://www.runninghub.ai/uc/openapi/apiKeyStatus',
-        'https://www.runninghub.ai/uc/openapi/getApiKey',
-        'https://www.runninghub.ai/uc/openapi/user/info',
-        'https://www.runninghub.ai/uc/openapi/accountInfo',
-        'https://www.runninghub.ai/task/openapi/user/balance',
-        'https://www.runninghub.ai/task/openapi/account/balance',
-        'https://www.runninghub.cn/uc/openapi/apiKeyStatus',
-        'https://www.runninghub.cn/uc/openapi/getApiKey',
-        'https://www.runninghub.cn/uc/openapi/user/info',
-      ];
-
-      for (const endpoint of endpoints) {
-        try {
-          const response = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-              'User-Agent': 'RunningHubClient/1.0',
-            },
-            body: JSON.stringify({ apiKey: cleanKey }),
-          });
-
-          if (response.ok) {
-            const data = await safeParseResponse(response);
-            if (data && (data.code === 0 || data.code === 200)) {
-              const numBal = extractNumericBalance(data.data) || extractNumericBalance(data);
-              if (numBal !== null) {
-                res.json({
-                  code: 0,
-                  valid: true,
-                  balance: numBal,
-                  data: data.data || data,
-                });
-                return;
-              }
-            }
-          }
-        } catch {
-          // Try next endpoint
-        }
-      }
-
-      // If specific balance endpoint didn't respond with numeric value, test with outputs query to verify validity
-      const testRes = await fetch('https://www.runninghub.ai/task/openapi/outputs', {
+      // 1. Direct and lightning-fast key validity verification via RunningHub openapi outputs query
+      let testRes = await fetch('https://www.runninghub.ai/task/openapi/outputs', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
+          'User-Agent': 'RunningHubClient/1.0',
         },
-        body: JSON.stringify({ apiKey: cleanKey, taskId: 'test_check' }),
+        body: JSON.stringify({ apiKey: cleanKey, taskId: '12345678' }),
       });
+
+      if (!testRes.ok && testRes.status >= 500) {
+        testRes = await fetch('https://www.runninghub.cn/task/openapi/outputs', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'RunningHubClient/1.0',
+          },
+          body: JSON.stringify({ apiKey: cleanKey, taskId: '12345678' }),
+        });
+      }
 
       const testData = await safeParseResponse(testRes);
       const code = Number(testData?.code);
+      const msg = String(testData?.msg || '').toUpperCase();
+
       const isInvalid =
+        code === 806 ||
         code === 401 ||
-        String(testData?.msg || '').toUpperCase().includes('KEY_INVALID') ||
-        String(testData?.msg || '').toUpperCase().includes('UNAUTHORIZED');
+        code === 403 ||
+        code === 802 ||
+        msg.includes('APIKEY_USER_NOT_FOUND') ||
+        msg.includes('APIKEY_NOT_EXIST') ||
+        msg.includes('INVALID') ||
+        msg.includes('UNAUTHORIZED');
 
       if (isInvalid) {
-        res.json({ code: 401, valid: false, balance: null, msg: 'API Key tidak valid atau tidak terdaftar' });
-      } else {
-        const numBal = extractNumericBalance(testData?.data) || extractNumericBalance(testData);
         res.json({
-          code: 0,
-          valid: true,
-          balance: numBal !== null ? numBal : 'Terhubung',
-          msg: 'API Key valid',
+          code: 401,
+          valid: false,
+          balance: null,
+          msg: 'API Key tidak valid atau tidak terdaftar di RunningHub',
         });
+        return;
       }
+
+      // 2. Key is confirmed valid! Check if balance or coins info can be retrieved
+      let balanceStr = 'Valid / Ready';
+      if (testData?.data && typeof testData.data === 'object' && testData.data.coins !== undefined) {
+        balanceStr = String(testData.data.coins);
+      }
+
+      res.json({
+        code: 0,
+        valid: true,
+        balance: balanceStr,
+        msg: 'API Key valid & aktif',
+      });
     } catch (err: any) {
+      console.error('Error in check-key:', err);
       res.status(500).json({ code: 500, msg: err?.message || 'Gagal memeriksa status API Key' });
     }
   });
